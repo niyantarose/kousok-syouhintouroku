@@ -1,0 +1,693 @@
+/******************************************************
+ * ⑪API再アップロード.gs
+ * v9.0 — fetchAll並列DL + 堅牢ロジック + 自動継続
+ *
+ * ★ 統合版のポイント
+ * - UrlFetchApp.fetchAll() で Drive 画像を一括並列ダウンロード（最大の高速化）
+ * - WebP→JPG 変換も fetchAll で並列処理
+ * - 自動継続トリガー（6分制限対策）
+ * - 免責画像の正規化名（notice_tw_goods_01.jpg 等）を維持
+ * - 堅牢なソート・数字抽出・免責判定ロジック
+ ******************************************************/
+
+var YahooReupload = YahooReupload || {};
+
+/** =====================================================
+ * 設定
+ * ===================================================== */
+YahooReupload.CONFIG = {
+  SHEET_NAME: '①商品入力シート',
+  HEADER_ROWS: 2,
+
+  COL_CODE: 3,
+  COL_NAME: 4,
+  COL_S: 19,
+  COL_T: 20,
+
+  DRIVE_PRODUCT_ROOT_ID: '1Vk1cVgrXM5CNFqfBvAaBUJpheDn4f9Lz',
+  DRIVE_DISCLAIMER_ROOT_ID: '1qfwT1NC3wwKgOLx2rvnSH836Zc0hROIa',
+
+  MAX_TOTAL: 21,
+  MAX_DETAIL: 20,
+  MAX_DISC: 3,
+
+  ZIP_BATCH_MAX_FILES: 60,
+
+  WEBP2JPG_ENDPOINT: 'https://img.niyantarose.com/webp2jpg.php',
+  WEBP2JPG_TIMEOUT_MS: 60000,
+
+  YAHOO_ZIP_UPLOAD_ENDPOINT: 'https://img.niyantarose.com/yahoo_zip_upload.php',
+  YAHOO_ZIP_UPLOAD_TIMEOUT_MS: 120000,
+
+  SELLER_ID: 'niyantarose',
+
+  BASIC_AUTH_USER: '',
+  BASIC_AUTH_PASS: '',
+
+  DEBUG_SAVE_ZIP_TO_DRIVE: false,
+  DEBUG_ZIP_OUT_FOLDER_ID: '',
+
+  DEBUG: true,
+
+  // 自動継続
+  SAFE_TIME_MS: 4 * 60 * 1000,  // 4分で中断（fetchAllで高速化した分余裕あり）
+  CONTINUE_DELAY_MIN: 1,
+  STATE_KEY: 'YAHOO_REUPLOAD_STATE'
+};
+
+/** =====================================================
+ * 免責固定名
+ * ===================================================== */
+YahooReupload.免責固定名 = {
+  '韓国マンガ初版限定免責画像': ['notice_kr_manga_first_01.jpg', 'notice_kr_manga_first_02.jpg'],
+  '韓国マンガ一般版免責画像': ['notice_kr_manga_standard_01.jpg', 'notice_kr_manga_standard_02.jpg'],
+  '韓国マンガ特装版免責画像': ['notice_kr_manga_special_01.jpg', 'notice_kr_manga_special_02.jpg'],
+  '韓国マンガ限定版免責画像': ['notice_kr_manga_limited_01.jpg', 'notice_kr_manga_limited_02.jpg'],
+  'グッズ免責画像': ['notice_goods_01.jpg'],
+  '台湾免責画像': ['notice_tw_goods_01.jpg', 'notice_tw_goods_02.jpg']
+};
+
+/** =====================================================
+ * UI通知（UIが無くても安全）
+ * ===================================================== */
+function YahooReupload__notify_(msg) {
+  try { SpreadsheetApp.getActiveSpreadsheet().toast(msg, 'Yahoo再アップロード', 10); } catch (e) {}
+  Logger.log('[YahooReupload] ' + msg);
+}
+
+function YahooReupload__alertSafe_(msg) {
+  try { SpreadsheetApp.getUi().alert(String(msg)); return; } catch (e) {}
+  try { SpreadsheetApp.getActiveSpreadsheet().toast(String(msg), 'Yahoo再アップロード', 10); } catch (e2) {}
+  Logger.log('[YahooReupload_ALERT] ' + msg);
+}
+
+/** =====================================================
+ * 状態管理（PropertiesService）
+ * ===================================================== */
+function YahooReupload__loadState_() {
+  var raw = PropertiesService.getScriptProperties().getProperty(YahooReupload.CONFIG.STATE_KEY);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+function YahooReupload__saveState_(state) {
+  PropertiesService.getScriptProperties().setProperty(
+    YahooReupload.CONFIG.STATE_KEY, JSON.stringify(state)
+  );
+}
+
+function YahooReupload__clearState_() {
+  PropertiesService.getScriptProperties().deleteProperty(YahooReupload.CONFIG.STATE_KEY);
+}
+
+/** =====================================================
+ * 自動継続トリガー管理
+ * ===================================================== */
+function YahooReupload__setContinueTrigger_() {
+  YahooReupload__deleteContinueTriggers_();
+  ScriptApp.newTrigger('Yahoo再アップロード_自動継続_')
+    .timeBased()
+    .after(YahooReupload.CONFIG.CONTINUE_DELAY_MIN * 60 * 1000)
+    .create();
+  YahooReupload__log_('[継続] ' + YahooReupload.CONFIG.CONTINUE_DELAY_MIN + '分後に再開トリガーセット');
+}
+
+function YahooReupload__deleteContinueTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === 'Yahoo再アップロード_自動継続_') ScriptApp.deleteTrigger(t);
+  });
+}
+
+/** =====================================================
+ * エントリポイント
+ * ===================================================== */
+function Yahoo再アップロード_一括実行() {
+  var existingState = YahooReupload__loadState_();
+  if (existingState && existingState.phase === 'running') {
+    try {
+      var ui = SpreadsheetApp.getUi();
+      var resp = ui.alert('前回の処理が途中です',
+        '前回の続きから再開しますか？\n（「いいえ」で最初からやり直し）',
+        ui.ButtonSet.YES_NO_CANCEL);
+      if (resp === ui.Button.CANCEL) return;
+      if (resp === ui.Button.NO) { YahooReupload__clearState_(); existingState = null; }
+    } catch (e) {}
+  }
+
+  if (existingState && existingState.phase === 'running') {
+    YahooReupload__processFromState_(existingState);
+  } else {
+    YahooReupload__startFresh_();
+  }
+}
+
+function Yahoo再アップロード_自動継続_() {
+  YahooReupload__deleteContinueTriggers_();
+  var state = YahooReupload__loadState_();
+  if (!state || state.phase !== 'running') {
+    YahooReupload__log_('[継続] 状態なし or 完了済み');
+    return;
+  }
+  YahooReupload__log_('[継続] 自動再開: バッチ ' + (state.nextBatchIndex + 1) + '/' + state.totalBatches);
+  YahooReupload__processFromState_(state);
+}
+
+function Yahoo再アップロード_リセット() {
+  YahooReupload__clearState_();
+  YahooReupload__deleteContinueTriggers_();
+  YahooReupload__alertSafe_('状態をリセットしました');
+}
+
+/** =====================================================
+ * 新規開始：収集 → バッチ分割 → 処理開始
+ * ===================================================== */
+function YahooReupload__startFresh_() {
+  var t0 = Date.now();
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(YahooReupload.CONFIG.SHEET_NAME);
+  if (!sh) throw new Error('シートが見つかりません: ' + YahooReupload.CONFIG.SHEET_NAME);
+
+  var rows = YahooReupload__getAllDataRows_(sh);
+  if (!rows.length) { YahooReupload__alertSafe_('対象行がありません'); return; }
+
+  var productRoot = DriveApp.getFolderById(YahooReupload.CONFIG.DRIVE_PRODUCT_ROOT_ID);
+  var discRoot = DriveApp.getFolderById(YahooReupload.CONFIG.DRIVE_DISCLAIMER_ROOT_ID);
+
+  YahooReupload__log_('--- [Step1] 収集開始 (' + rows.length + '行) ---');
+
+  var jobs = [];
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var rowVals = sh.getRange(r, 1, 1, Math.max(YahooReupload.CONFIG.COL_T, YahooReupload.CONFIG.COL_NAME)).getValues()[0];
+    var code = String(rowVals[YahooReupload.CONFIG.COL_CODE - 1] || '').trim();
+    var name = String(rowVals[YahooReupload.CONFIG.COL_NAME - 1] || '').trim();
+    if (!code) continue;
+
+    var pack = YahooReupload__collectFilesForCode_(productRoot, discRoot, code, name);
+    if (!pack.files.length) continue;
+
+    jobs.push({ row: r, code: code, name: name, discCategory: pack.discCategory, files: pack.files });
+  }
+
+  if (!jobs.length) { YahooReupload__alertSafe_('画像が見つからなかった'); return; }
+
+  var totalFiles = jobs.reduce(function(acc, j) { return acc + j.files.length; }, 0);
+  YahooReupload__log_('収集完了: items=' + jobs.length + ' / files=' + totalFiles);
+
+  var batches = YahooReupload__splitIntoBatches_(jobs);
+  YahooReupload__log_('バッチ数: ' + batches.length);
+
+  var state = {
+    phase: 'running',
+    batches: batches,
+    nextBatchIndex: 0,
+    totalBatches: batches.length,
+    totalItems: jobs.length,
+    totalFiles: totalFiles,
+    sentBatches: 0,
+    startTime: t0
+  };
+
+  YahooReupload__saveState_(state);
+  YahooReupload__processFromState_(state);
+}
+
+/** =====================================================
+ * バッチ分割
+ * ===================================================== */
+function YahooReupload__splitIntoBatches_(jobs) {
+  var batches = [];
+  var current = [];
+  var currentCount = 0;
+  var maxFiles = YahooReupload.CONFIG.ZIP_BATCH_MAX_FILES;
+
+  for (var i = 0; i < jobs.length; i++) {
+    var job = jobs[i];
+    if (currentCount + job.files.length > maxFiles && current.length > 0) {
+      batches.push(current);
+      current = [];
+      currentCount = 0;
+    }
+    current.push({ code: job.code, files: job.files });
+    currentCount += job.files.length;
+    if (currentCount >= maxFiles) {
+      batches.push(current);
+      current = [];
+      currentCount = 0;
+    }
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+/** =====================================================
+ * 状態から処理再開（核心部分）
+ * ===================================================== */
+function YahooReupload__processFromState_(state) {
+  var runStart = Date.now();
+
+  YahooReupload__log_('--- [Step2] 並列DL & ZIP送信 (バッチ ' +
+    (state.nextBatchIndex + 1) + '/' + state.totalBatches + ' から) ---');
+
+  while (state.nextBatchIndex < state.totalBatches) {
+    // 時間チェック
+    if (Date.now() - runStart > YahooReupload.CONFIG.SAFE_TIME_MS) {
+      YahooReupload__log_('[時間切れ] 中断 → 継続トリガーセット');
+      YahooReupload__saveState_(state);
+      YahooReupload__setContinueTrigger_();
+      YahooReupload__notify_(
+        'バッチ ' + state.nextBatchIndex + '/' + state.totalBatches +
+        ' まで完了。自動再開します。'
+      );
+      return;
+    }
+
+    var batchIdx = state.nextBatchIndex;
+    var batch = state.batches[batchIdx];
+    var fileCount = batch.reduce(function(a, b) { return a + b.files.length; }, 0);
+    YahooReupload__log_('  >> バッチ ' + (batchIdx + 1) + '/' + state.totalBatches + ' (' + fileCount + 'ファイル)');
+
+    try {
+      YahooReupload__flushBatch_(batch);
+      state.sentBatches++;
+    } catch (e) {
+      YahooReupload__log_('[ERROR] バッチ ' + (batchIdx + 1) + ' 送信失敗: ' + e.message);
+    }
+
+    state.nextBatchIndex++;
+    YahooReupload__saveState_(state);
+  }
+
+  // 全バッチ完了
+  YahooReupload__clearState_();
+  YahooReupload__deleteContinueTriggers_();
+
+  var totalElapsed = Date.now() - (state.startTime || Date.now());
+  var msg = '全バッチ完了！\n' +
+    '商品数: ' + state.totalItems + '\n' +
+    'ファイル数: ' + state.totalFiles + '\n' +
+    '送信バッチ: ' + state.sentBatches + '\n' +
+    '総所要時間: ' + Math.round(totalElapsed / 1000) + '秒';
+  YahooReupload__log_(msg);
+  YahooReupload__alertSafe_(msg);
+}
+
+/** =====================================================
+ * ★ ターボ版 flushBatch：fetchAll で並列DL & 並列WebP変換
+ * ===================================================== */
+function YahooReupload__flushBatch_(batchItems) {
+  var tasks = [];
+
+  // 1. 全ファイルのタスクリスト作成（ソート・枚数制限適用済み）
+  for (var i = 0; i < batchItems.length; i++) {
+    var item = batchItems[i];
+    var code = item.code;
+    var parts = YahooReupload__splitAndSort_(item.files, code);
+    var allFiles = parts.product.concat(parts.disclaimer);
+
+    for (var j = 0; j < allFiles.length; j++) {
+      var fo = allFiles[j];
+      var lowerName = String(fo.name).toLowerCase();
+
+      // 拡張子判定
+      var extMatch = lowerName.match(/\.(jpe?g|png|gif|webp)$/i);
+      var ext = extMatch ? '.' + extMatch[1].toLowerCase() : '.jpg';
+      var isWebP = lowerName.endsWith('.webp');
+      if (ext === '.jpeg' || ext === '.webp') ext = '.jpg';
+
+      tasks.push({
+        fileId: fo.fileId,
+        zipName: (j === 0) ? code + ext : code + '_' + j + ext,
+        origName: fo.name,
+        isWebP: isWebP,
+        blob: null
+      });
+    }
+  }
+
+  // 2. ★ fetchAll で全ファイルを一括並列ダウンロード
+  YahooReupload__log_('  [fetchAll] ' + tasks.length + 'ファイルを並列取得中...');
+  var token = ScriptApp.getOAuthToken();
+  var driveRequests = tasks.map(function(t) {
+    return {
+      url: 'https://www.googleapis.com/drive/v2/files/' + t.fileId + '?alt=media',
+      method: 'get',
+      headers: { 'Authorization': 'Bearer ' + token },
+      muteHttpExceptions: true
+    };
+  });
+
+  var driveResponses = UrlFetchApp.fetchAll(driveRequests);
+  var dlFail = 0;
+  for (var k = 0; k < driveResponses.length; k++) {
+    if (driveResponses[k].getResponseCode() === 200) {
+      tasks[k].blob = driveResponses[k].getBlob().setName(tasks[k].zipName);
+    } else {
+      // フォールバック：DriveApp で単体取得
+      try {
+        tasks[k].blob = DriveApp.getFileById(tasks[k].fileId).getBlob().setName(tasks[k].zipName);
+      } catch (e) {
+        YahooReupload__log_('  [WARN] DL失敗: ' + tasks[k].origName + ' ' + e.message);
+        dlFail++;
+      }
+    }
+  }
+  if (dlFail > 0) YahooReupload__log_('  [DL] 失敗: ' + dlFail + '件（スキップ）');
+
+  // 3. ★ WebPファイルを fetchAll で一括並列変換
+  var webpTasks = tasks.filter(function(t) { return t.isWebP && t.blob; });
+  if (webpTasks.length > 0) {
+    YahooReupload__log_('  [WebP] ' + webpTasks.length + 'ファイルを並列変換中...');
+    YahooReupload__batchConvertWebP_(webpTasks);
+  }
+
+  // 4. ZIP圧縮 & 送信
+  var validBlobs = tasks.filter(function(t) { return t.blob != null; }).map(function(t) { return t.blob; });
+  YahooReupload__log_('  [ZIP] 圧縮中... (' + validBlobs.length + 'ファイル)');
+  var zipBlob = Utilities.zip(validBlobs, 'yahoo_images_' + Utilities.getUuid() + '.zip');
+
+  if (YahooReupload.CONFIG.DEBUG_SAVE_ZIP_TO_DRIVE) {
+    if (!YahooReupload.CONFIG.DEBUG_ZIP_OUT_FOLDER_ID) throw new Error('DEBUG_ZIP_OUT_FOLDER_ID が空');
+    DriveApp.getFolderById(YahooReupload.CONFIG.DEBUG_ZIP_OUT_FOLDER_ID).createFile(zipBlob);
+    YahooReupload__log_('  [DEBUG] ZIPをDriveに保存');
+    return;
+  }
+
+  YahooReupload__sendZipToServer_(zipBlob);
+}
+
+/** =====================================================
+ * WebP 一括変換（fetchAll）
+ * ===================================================== */
+function YahooReupload__batchConvertWebP_(webpTasks) {
+  var endpoint = String(YahooReupload.CONFIG.WEBP2JPG_ENDPOINT || '').trim();
+  if (!endpoint) return;
+
+  var requests = webpTasks.map(function(task) {
+    return {
+      url: endpoint,
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Accept: 'application/json' },
+      payload: JSON.stringify({
+        filename: task.origName,
+        base64: Utilities.base64Encode(task.blob.getBytes())
+      }),
+      muteHttpExceptions: true
+    };
+  });
+
+  try {
+    var responses = UrlFetchApp.fetchAll(requests);
+    for (var i = 0; i < responses.length; i++) {
+      if (responses[i].getResponseCode() === 200) {
+        try {
+          var obj = JSON.parse(responses[i].getContentText());
+          if (obj.ok && obj.base64) {
+            webpTasks[i].blob = Utilities.newBlob(
+              Utilities.base64Decode(obj.base64), 'image/jpeg', webpTasks[i].zipName
+            );
+          }
+        } catch (e) {
+          YahooReupload__log_('  [WARN] WebP変換JSONパース失敗: ' + webpTasks[i].origName);
+        }
+      } else {
+        YahooReupload__log_('  [WARN] WebP変換HTTP失敗: ' + webpTasks[i].origName +
+          ' code=' + responses[i].getResponseCode());
+      }
+    }
+  } catch (e) {
+    YahooReupload__log_('[ERROR] WebP一括変換エラー: ' + e.message);
+  }
+}
+
+/** =====================================================
+ * 収集：1コードのDriveフォルダから画像列挙
+ * ===================================================== */
+function YahooReupload__collectFilesForCode_(productRoot, discRoot, code, name) {
+  var it = productRoot.getFoldersByName(code);
+  if (!it.hasNext()) {
+    YahooReupload__log_('[WARN] フォルダなし: ' + code);
+    return { discCategory: '', files: [] };
+  }
+  var folder = it.next();
+  var discCategory = YahooReupload__detectDiscCategory_(name);
+
+  var files = [];
+  var fIt = folder.getFiles();
+  while (fIt.hasNext()) {
+    var f = fIt.next();
+    var mime = f.getMimeType();
+    if (!mime || mime.indexOf('image/') !== 0) continue;
+    var fname = f.getName();
+    files.push({
+      isDisclaimer: YahooReupload__isDisclaimerName_(fname),
+      name: fname,
+      fileId: f.getId()
+    });
+  }
+
+  // フォルダ内に免責画像がなければ免責ルートから追加
+  var hasDisc = files.some(function(x) { return x.isDisclaimer; });
+  if (!hasDisc && discCategory) {
+    var extra = YahooReupload__pickDisclaimerFilesFromRoot_(discRoot, discCategory, YahooReupload.CONFIG.MAX_DISC);
+    extra.forEach(function(x) { files.push(x); });
+  }
+
+  return { discCategory: discCategory, files: files };
+}
+
+/** =====================================================
+ * 分離＆並び替え（堅牢版）
+ * ===================================================== */
+function YahooReupload__splitAndSort_(files, code) {
+  var product = [];
+  var disclaimer = [];
+
+  files.forEach(function(x) {
+    (x.isDisclaimer ? disclaimer : product).push(x);
+  });
+
+  // 商品画像：数字優先ソート
+  product.sort(function(a, b) {
+    var an = YahooReupload__extractOrderNum_(a.name);
+    var bn = YahooReupload__extractOrderNum_(b.name);
+    if (an != null && bn != null) return an - bn;
+    if (an != null) return -1;
+    if (bn != null) return 1;
+    return a.name.localeCompare(b.name, 'ja');
+  });
+
+  // 免責画像：固定名順ソート
+  var order = YahooReupload__buildDisclaimerOrder_();
+  disclaimer.sort(function(a, b) {
+    var ai = order[String(a.name).toLowerCase()];
+    var bi = order[String(b.name).toLowerCase()];
+    if (ai != null && bi != null) return ai - bi;
+    if (ai != null) return -1;
+    if (bi != null) return 1;
+    return a.name.localeCompare(b.name, 'ja');
+  });
+
+  // 枚数制限
+  var keepDisc = disclaimer.slice(0, Math.min(disclaimer.length, YahooReupload.CONFIG.MAX_DISC));
+  var remain = Math.max(0, YahooReupload.CONFIG.MAX_TOTAL - keepDisc.length);
+  var keepProd = product.slice(0, remain);
+
+  return { product: keepProd, disclaimer: keepDisc };
+}
+
+/** =====================================================
+ * 免責カテゴリ判定（全パターン対応）
+ * ===================================================== */
+function YahooReupload__detectDiscCategory_(name) {
+  if (!name) return '';
+  var t = String(name);
+  if (t.indexOf('台湾') !== -1) return '台湾免責画像';
+  if (t.indexOf('グッズ') !== -1) return 'グッズ免責画像';
+  if (t.indexOf('初版限定') !== -1) return '韓国マンガ初版限定免責画像';
+  if (t.indexOf('特装版') !== -1) return '韓国マンガ特装版免責画像';
+  if (t.indexOf('限定版') !== -1) return '韓国マンガ限定版免責画像';
+  if (t.indexOf('一般') !== -1 || t.indexOf('通常版') !== -1) return '韓国マンガ一般版免責画像';
+  if (t.indexOf('韓国語') !== -1 || t.indexOf('韓国') !== -1) return '韓国マンガ一般版免責画像';
+  return '';
+}
+
+function YahooReupload__isDisclaimerName_(fileName) {
+  var n = String(fileName || '').toLowerCase();
+  return n.indexOf('notice_') === 0 || n.indexOf('免責') !== -1;
+}
+
+/** =====================================================
+ * 免責ルートからカテゴリの先頭N枚を拾う（正規化名付き）
+ * ===================================================== */
+function YahooReupload__pickDisclaimerFilesFromRoot_(discRoot, discCategory, maxCount) {
+  var it = discRoot.getFoldersByName(discCategory);
+  if (!it.hasNext()) return [];
+  var folder = it.next();
+  var arr = [];
+  var fIt = folder.getFiles();
+  while (fIt.hasNext()) {
+    var f = fIt.next();
+    var name = f.getName();
+    if (!/\.(jpe?g|png|webp|gif)$/i.test(name)) continue;
+    arr.push({ file: f, name: name, num: YahooReupload__extractOrderNum_(name) });
+  }
+  arr.sort(function(a, b) {
+    if (a.num != null && b.num != null) return a.num - b.num;
+    if (a.num != null) return -1;
+    if (b.num != null) return 1;
+    return a.name.localeCompare(b.name, 'ja');
+  });
+  var limit = Math.min(maxCount || 2, arr.length);
+  var out = [];
+  for (var i = 0; i < limit; i++) {
+    out.push({
+      isDisclaimer: true,
+      name: YahooReupload__normalizeDisclaimerName_(discCategory, i + 1, arr[i].name),
+      fileId: arr[i].file.getId()
+    });
+  }
+  return out;
+}
+
+/** =====================================================
+ * 免責ファイル名正規化（カテゴリに応じた命名）
+ * ===================================================== */
+function YahooReupload__normalizeDisclaimerName_(discCategory, idx, origName) {
+  var prefix = '';
+  switch (discCategory) {
+    case '台湾免責画像': prefix = 'notice_tw_goods'; break;
+    case 'グッズ免責画像': prefix = 'notice_goods'; break;
+    case '韓国マンガ初版限定免責画像': prefix = 'notice_kr_manga_first'; break;
+    case '韓国マンガ一般版免責画像': prefix = 'notice_kr_manga_standard'; break;
+    case '韓国マンガ特装版免責画像': prefix = 'notice_kr_manga_special'; break;
+    case '韓国マンガ限定版免責画像': prefix = 'notice_kr_manga_limited'; break;
+    default:
+      if (/^notice_/i.test(origName)) return origName;
+      return 'notice_' + idx + '.jpg';
+  }
+  return prefix + '_' + ('0' + idx).slice(-2) + '.jpg';
+}
+
+/** =====================================================
+ * 数字抽出（全パターン対応）
+ * ===================================================== */
+function YahooReupload__extractOrderNum_(name) {
+  var s = String(name || '');
+
+  // 丸数字 ①②③...
+  var m = s.match(/^([①②③④⑤⑥⑦⑧⑨⑩])/);
+  if (m) {
+    var map = { '①': 1, '②': 2, '③': 3, '④': 4, '⑤': 5, '⑥': 6, '⑦': 7, '⑧': 8, '⑨': 9, '⑩': 10 };
+    return map[m[1]] || null;
+  }
+
+  // 先頭の数字
+  m = s.match(/^(\d{1,2})/);
+  if (m) return Number(m[1]);
+
+  // _01 / -02 など（拡張子直前）
+  m = s.match(/[_-](\d{1,2})(?=\.[^.]+$)/);
+  if (m) return Number(m[1]);
+
+  // 末尾の数字（拡張子直前）
+  m = s.match(/(\d{1,2})(?=\.[^.]+$)/);
+  if (m) return Number(m[1]);
+
+  return null;
+}
+
+/** =====================================================
+ * ZIP送信
+ * ===================================================== */
+function YahooReupload__sendZipToServer_(zipBlob) {
+  var endpoint = String(YahooReupload.CONFIG.YAHOO_ZIP_UPLOAD_ENDPOINT || '').trim();
+  if (!endpoint) throw new Error('YAHOO_ZIP_UPLOAD_ENDPOINT が空');
+
+  var sellerId = String(YahooReupload.CONFIG.SELLER_ID || '').trim();
+  if (!sellerId) throw new Error('SELLER_ID が空');
+
+  var headers = { 'Accept': 'application/json' };
+  var u = String(YahooReupload.CONFIG.BASIC_AUTH_USER || '').trim();
+  var p = String(YahooReupload.CONFIG.BASIC_AUTH_PASS || '').trim();
+  if (u && p) headers['Authorization'] = 'Basic ' + Utilities.base64Encode(u + ':' + p);
+
+  var res = UrlFetchApp.fetch(endpoint, {
+    method: 'post',
+    payload: { seller_id: sellerId, zip: zipBlob },
+    headers: headers,
+    muteHttpExceptions: true,
+    followRedirects: true,
+    timeout: YahooReupload.CONFIG.YAHOO_ZIP_UPLOAD_TIMEOUT_MS || 120000
+  });
+
+  var http = res.getResponseCode();
+  var text = res.getContentText();
+
+  if (http !== 200) throw new Error('ZIP送信失敗: HTTP ' + http + '\n' + text.slice(0, 1200));
+
+  var obj = null;
+  try { obj = JSON.parse(text); } catch (e) {
+    YahooReupload__log_('  [ZIP送信] HTTP200だがJSON解析失敗: ' + e);
+    return;
+  }
+
+  YahooReupload__log_('  [ZIP送信] OK run_id=' + (obj.run_id || '') + ' elapsed_ms=' + (obj.elapsed_ms || ''));
+
+  if (obj.ok !== true) throw new Error('VPSが ok=false を返した: ' + text.slice(0, 1200));
+
+  if (YahooReupload.CONFIG.DEBUG) {
+    YahooReupload__dbg_('  [VPSレスポンス] ' + text.slice(0, 1200));
+  }
+}
+
+/** =====================================================
+ * 対象行取得
+ * ===================================================== */
+function YahooReupload__getAllDataRows_(sheet) {
+  var cfg = YahooReupload.CONFIG;
+  var startRow = cfg.HEADER_ROWS + 1;
+  var lastRow = sheet.getLastRow();
+  if (lastRow < startRow) return [];
+
+  var values = sheet.getRange(startRow, cfg.COL_CODE, lastRow - startRow + 1, 1).getValues();
+  var rows = [];
+  for (var i = 0; i < values.length; i++) {
+    var code = String(values[i][0] || '').trim();
+    if (code) rows.push(startRow + i);
+  }
+  return rows;
+}
+
+/** =====================================================
+ * 免責の固定順序辞書
+ * ===================================================== */
+function YahooReupload__buildDisclaimerOrder_() {
+  var map = {};
+  var idx = 0;
+  Object.keys(YahooReupload.免責固定名 || {}).forEach(function(cat) {
+    (YahooReupload.免責固定名[cat] || []).forEach(function(fname) {
+      var k = String(fname).toLowerCase();
+      if (map[k] == null) map[k] = idx++;
+    });
+  });
+  return map;
+}
+
+/** =====================================================
+ * ログ
+ * ===================================================== */
+function YahooReupload__log_(msg) { Logger.log(msg); }
+function YahooReupload__dbg_(msg) { if (YahooReupload.CONFIG.DEBUG) Logger.log(msg); }
+
+/** =====================================================
+ * テスト
+ * ===================================================== */
+function WEBP2JPG_疎通テスト() {
+  var url = YahooReupload.CONFIG.WEBP2JPG_ENDPOINT;
+  var res = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true, followRedirects: false });
+  Logger.log("URL=" + url);
+  Logger.log("status=" + res.getResponseCode());
+  Logger.log("body=" + res.getContentText().slice(0, 200));
+}
